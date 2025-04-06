@@ -76,6 +76,7 @@ export const login = async (req, res) => {
       user, 
       message: "Login successful" 
     });
+    
   } catch (error) {
     console.error("Error during login:", error);
     res.status(500).json({ message: "Internal server error" });
@@ -102,5 +103,37 @@ export const setNewPassword = async (req, res) => {
     res.json({ message: "Password set successfully" });
   } catch (error) {
     res.status(500).json({ message: "Internal server error" });
+  }
+};
+
+export const getUserDetails = async (req, res) => {
+  try {
+    const { id } = req.params; // Get user ID from the request parameters
+
+    // Find user by ID in the database
+    const user = await User.findById(id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Return user details
+    return res.status(200).json({
+      success: true,
+      message: "User details fetched successfully",
+      data: user,
+    });
+  } catch (error) {
+    console.error("Error fetching user details:", error);
+
+    // Handle errors
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
   }
 };
