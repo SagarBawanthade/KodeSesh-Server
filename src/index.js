@@ -150,8 +150,30 @@ io.on("connection", (socket) => {
   socket.on("getParticipants", (sessionId) => {
     if (sessionParticipants[sessionId]) {
       socket.emit("participantsList", sessionParticipants[sessionId]);
+      socket.emit('languageUpdate', { language: sessionParticipants[sessionId].currentLanguage });
+      
     } else {
       socket.emit("participantsList", []);
+    }
+  });
+
+
+  // Handle language update
+  socket.on('languageUpdate', ({ sessionId, language }) => {
+    console.log(`Language update in session ${sessionId}: ${language}`);
+    
+    // Update session state
+    if (sessionParticipants[sessionId]) {
+      sessionParticipants[sessionId].currentLanguage = language;
+    }
+    
+    // Broadcast to all clients in the session except sender
+    socket.to(sessionId).emit('languageUpdate', { language });
+  });
+   // Handle request for current language state
+   socket.on('getLanguageState', (sessionId) => {
+    if (sessionParticipants[sessionId]) {
+      socket.emit('languageUpdate', { language: sessionParticipants[sessionId].currentLanguage });
     }
   });
   
