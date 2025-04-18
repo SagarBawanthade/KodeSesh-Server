@@ -87,12 +87,6 @@ app.use("/api/session/execute", executeRoute);
 // Create HTTP server
 const server = http.createServer(app);
 
- 
-
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
 // WebSocket server
 const io = new Server(server, {
   cors: {
@@ -102,6 +96,20 @@ const io = new Server(server, {
   transports: ["websocket", "polling"], // Add polling as fallback
 });
 
+// Global session storage
+const sessions = {};
+
+// Helper function to find a socket by userID
+function findSocketByUserId(sessionId, userId) {
+  if (!sessions[sessionId]) return null;
+  
+  const participant = sessions[sessionId].participants.find(
+    p => p.id.toString() === userId.toString()
+  );
+  
+  return participant ? io.sockets.sockets.get(participant.socketId) : null;
+}
+
 // Single connection handler
 io.on("connection", (socket) => {
   console.log("New client connected:", socket.id);
@@ -109,16 +117,19 @@ io.on("connection", (socket) => {
   // Store user info with socket
   let userId = null;
   let currentSessionId = null;
-  const sessionParticipants = {};
   
   socket.on("joinSession", (sessionId) => {
     console.log(`Client ${socket.id} joining session: ${sessionId}`);
     socket.join(sessionId);
     currentSessionId = sessionId;
     
-    // Initialize session participants array if needed
-    if (!sessionParticipants[sessionId]) {
-      sessionParticipants[sessionId] = [];
+    // Initialize session if needed
+    if (!sessions[sessionId]) {
+      sessions[sessionId] = {
+        participants: [],
+        language: 'javascript',
+        code: '// Start writing your code here!'
+      };
     }
     
     // Get number of clients in room
@@ -126,54 +137,76 @@ io.on("connection", (socket) => {
     console.log(`Clients in session ${sessionId}: ${clients ? clients.size : 0}`);
   });
   
-  socket.on("userJoined", ({ userId: id, name, isHost }) => {
+  socket.on("userJoined", ({ userId: id, name, isHost, sessionId }) => {
     userId = id;
+    currentSessionId = sessionId;
     
-    if (currentSessionId) {
-      const newParticipant = {
-        id,
-        name,
-        isHost,
-        isMuted: false,
-        isVideoOff: false
+    if (!sessions[sessionId]) {
+      sessions[sessionId] = {
+        participants: [],
+        language: 'javascript',
+        code: '// Start writing your code here!'
       };
-      
-      // Add to participants list
-      sessionParticipants[currentSessionId].push(newParticipant);
-      
-      // Notify all clients in the session
-      io.to(currentSessionId).emit("participantJoined", newParticipant);
-      io.to(currentSessionId).emit("participantsList", sessionParticipants[currentSessionId]);
     }
+    
+    // Create new participant object
+    const newParticipant = {
+      id,
+      name,
+      isHost,
+      socketId: socket.id,
+      isMuted: false,
+      isVideoOff: false,
+      isScreenSharing: false
+    };
+    
+    // Remove any existing entries for this user (in case of reconnection)
+    sessions[sessionId].participants = sessions[sessionId].participants.filter(
+      p => p.id.toString() !== id.toString()
+    );
+    
+    // Add to participants list
+    sessions[sessionId].participants.push(newParticipant);
+    
+    // Store sessionId and userId in socket for cleanup when disconnected
+    socket.sessionId = sessionId;
+    socket.userId = id;
+    
+    // Notify all clients in the session
+    io.to(sessionId).emit("participantJoined", newParticipant);
+    io.to(sessionId).emit("participantsList", sessions[sessionId].participants);
   });
   
   socket.on("getParticipants", (sessionId) => {
-    if (sessionParticipants[sessionId]) {
-      socket.emit("participantsList", sessionParticipants[sessionId]);
-      socket.emit('languageUpdate', { language: sessionParticipants[sessionId].currentLanguage });
+    if (sessions[sessionId]) {
+      console.log(`Sending participants list for session ${sessionId}: ${sessions[sessionId].participants.length} participants`);
+      socket.emit("participantsList", sessions[sessionId].participants);
       
+      if (sessions[sessionId].language) {
+        socket.emit('languageUpdate', { language: sessions[sessionId].language });
+      }
     } else {
       socket.emit("participantsList", []);
     }
   });
-
 
   // Handle language update
   socket.on('languageUpdate', ({ sessionId, language }) => {
     console.log(`Language update in session ${sessionId}: ${language}`);
     
     // Update session state
-    if (sessionParticipants[sessionId]) {
-      sessionParticipants[sessionId].currentLanguage = language;
+    if (sessions[sessionId]) {
+      sessions[sessionId].language = language;
     }
     
     // Broadcast to all clients in the session except sender
     socket.to(sessionId).emit('languageUpdate', { language });
   });
-   // Handle request for current language state
-   socket.on('getLanguageState', (sessionId) => {
-    if (sessionParticipants[sessionId]) {
-      socket.emit('languageUpdate', { language: sessionParticipants[sessionId].currentLanguage });
+  
+  // Handle request for current language state
+  socket.on('getLanguageState', (sessionId) => {
+    if (sessions[sessionId] && sessions[sessionId].language) {
+      socket.emit('languageUpdate', { language: sessions[sessionId].language });
     }
   });
   
@@ -181,33 +214,131 @@ io.on("connection", (socket) => {
     console.log(`Client ${socket.id} sent code update for session ${sessionId}`);
     // Make sure you're broadcasting the code content, not the whole object
     socket.to(sessionId).emit("codeUpdate", code);
+    
+    // Store latest code in session
+    if (sessions[sessionId]) {
+      sessions[sessionId].code = code;
+    }
+  });
+
+  // Listen for code execution results from other users
+  socket.on("executionResult", ({ sessionId, output, error, terminalEntries }) => {
+    console.log(`Client ${socket.id} shared execution result for session ${sessionId}`);
+    
+    if (terminalEntries) {
+      // New format: forward terminal entries to all other clients
+      socket.to(sessionId).emit("executionResult", { terminalEntries });
+    } else {
+      // Old format: forward output and error separately for backward compatibility
+      socket.to(sessionId).emit("executionResult", { output, error });
+    }
   });
   
-  // WebRTC signaling
+  // ===== IMPROVED WEBRTC SIGNALING =====
+  
+  // WebRTC signaling - ready for connections
   socket.on("rtcReady", ({ sessionId, userId }) => {
-    console.log(`Client ${socket.id} is ready for WebRTC in session ${sessionId}`);
+    console.log(`Client ${userId} (${socket.id}) is ready for WebRTC in session ${sessionId}`);
     
     // Notify all other clients in the session that a new participant is ready
     socket.to(sessionId).emit("rtcNewParticipant", { participantId: userId });
   });
   
+  // Explicit request for connection
+  socket.on("rtcRequestConnection", ({ sessionId, requesterId, targetId }) => {
+    console.log(`Client ${requesterId} requesting connection with ${targetId}`);
+    
+    // Find the socket for the target user
+    if (sessions[sessionId]) {
+      const targetParticipant = sessions[sessionId].participants.find(
+        p => p.id.toString() === targetId.toString()
+      );
+      
+      if (targetParticipant) {
+        // Send direct message to the target
+        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
+        if (targetSocket) {
+          targetSocket.emit("rtcNewParticipant", { participantId: requesterId });
+        } else {
+          // If we can't find the socket, broadcast to everyone
+          socket.to(sessionId).emit("rtcNewParticipant", { participantId: requesterId });
+        }
+      } else {
+        // Broadcast to everyone in case we can't find the exact participant
+        socket.to(sessionId).emit("rtcNewParticipant", { participantId: requesterId });
+      }
+    }
+  });
+  
+  // WebRTC offer from one peer to another
   socket.on("rtcOffer", ({ sessionId, senderId, receiverId, sdp }) => {
     console.log(`Client ${senderId} sent offer to ${receiverId}`);
     
-    // Forward the offer to the intended recipient
+    // Try to find the target socket
+    if (sessions[sessionId]) {
+      const targetParticipant = sessions[sessionId].participants.find(
+        p => p.id.toString() === receiverId.toString()
+      );
+      
+      if (targetParticipant) {
+        // Send directly to the receiver
+        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
+        if (targetSocket) {
+          targetSocket.emit("rtcOffer", { senderId, sdp });
+          return;
+        }
+      }
+    }
+    
+    // Fallback: broadcast to session (less efficient but ensures delivery)
     socket.to(sessionId).emit("rtcOffer", { senderId, sdp });
   });
+  
+  // WebRTC answer from recipient back to offerer
   socket.on("rtcAnswer", ({ sessionId, senderId, receiverId, sdp }) => {
     console.log(`Client ${senderId} sent answer to ${receiverId}`);
     
-    // Forward the answer to the intended recipient
+    // Try to find the target socket
+    if (sessions[sessionId]) {
+      const targetParticipant = sessions[sessionId].participants.find(
+        p => p.id.toString() === receiverId.toString()
+      );
+      
+      if (targetParticipant) {
+        // Send directly to the receiver
+        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
+        if (targetSocket) {
+          targetSocket.emit("rtcAnswer", { senderId, sdp });
+          return;
+        }
+      }
+    }
+    
+    // Fallback: broadcast to session
     socket.to(sessionId).emit("rtcAnswer", { senderId, sdp });
   });
   
+  // WebRTC ICE candidates
   socket.on("rtcIceCandidate", ({ sessionId, senderId, receiverId, candidate }) => {
     console.log(`Client ${senderId} sent ICE candidate to ${receiverId}`);
     
-    // Forward the ICE candidate to the intended recipient
+    // Try to find the target socket
+    if (sessions[sessionId]) {
+      const targetParticipant = sessions[sessionId].participants.find(
+        p => p.id.toString() === receiverId.toString()
+      );
+      
+      if (targetParticipant) {
+        // Send directly to the receiver
+        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
+        if (targetSocket) {
+          targetSocket.emit("rtcIceCandidate", { senderId, candidate });
+          return;
+        }
+      }
+    }
+    
+    // Fallback: broadcast to session
     socket.to(sessionId).emit("rtcIceCandidate", { senderId, candidate });
   });
   
@@ -216,8 +347,8 @@ io.on("connection", (socket) => {
     console.log(`User ${userId} ${isMuted ? 'muted' : 'unmuted'} their audio`);
     
     // Update participant status
-    if (sessionParticipants[sessionId]) {
-      const participant = sessionParticipants[sessionId].find(p => p.id === userId);
+    if (sessions[sessionId]) {
+      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
       if (participant) {
         participant.isMuted = isMuted;
       }
@@ -227,15 +358,15 @@ io.on("connection", (socket) => {
     socket.to(sessionId).emit("audioToggled", { userId, isMuted });
     
     // Update participants list
-    io.to(sessionId).emit("participantsList", sessionParticipants[sessionId]);
+    io.to(sessionId).emit("participantsList", sessions[sessionId]?.participants || []);
   });
   
   socket.on("videoToggled", ({ sessionId, userId, isVideoOff }) => {
     console.log(`User ${userId} ${isVideoOff ? 'turned off' : 'turned on'} their video`);
     
     // Update participant status
-    if (sessionParticipants[sessionId]) {
-      const participant = sessionParticipants[sessionId].find(p => p.id === userId);
+    if (sessions[sessionId]) {
+      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
       if (participant) {
         participant.isVideoOff = isVideoOff;
       }
@@ -245,11 +376,19 @@ io.on("connection", (socket) => {
     socket.to(sessionId).emit("videoToggled", { userId, isVideoOff });
     
     // Update participants list
-    io.to(sessionId).emit("participantsList", sessionParticipants[sessionId]);
+    io.to(sessionId).emit("participantsList", sessions[sessionId]?.participants || []);
   });
   
   socket.on("screenSharingStarted", ({ sessionId, userId }) => {
     console.log(`User ${userId} started screen sharing`);
+    
+    // Update participant status
+    if (sessions[sessionId]) {
+      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      if (participant) {
+        participant.isScreenSharing = true;
+      }
+    }
     
     // Broadcast to all participants in the session
     socket.to(sessionId).emit("screenSharingStarted", { userId });
@@ -258,28 +397,45 @@ io.on("connection", (socket) => {
   socket.on("screenSharingEnded", ({ sessionId, userId }) => {
     console.log(`User ${userId} ended screen sharing`);
     
+    // Update participant status
+    if (sessions[sessionId]) {
+      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      if (participant) {
+        participant.isScreenSharing = false;
+      }
+    }
+    
     // Broadcast to all participants in the session
     socket.to(sessionId).emit("screenSharingEnded", { userId });
   });
 
-
   socket.on("disconnect", () => {
     console.log(`Client disconnected: ${socket.id}`);
     
-    if (userId && currentSessionId && sessionParticipants[currentSessionId]) {
+    // Get sessionId and userId stored in socket data
+    const sessionId = socket.sessionId;
+    const userId = socket.userId;
+    
+    if (userId && sessionId && sessions[sessionId]) {
+      console.log(`Removing participant ${userId} from session ${sessionId}`);
+      
       // Remove from participants list
-      sessionParticipants[currentSessionId] = sessionParticipants[currentSessionId]
-        .filter(p => p.id !== userId);
+      sessions[sessionId].participants = sessions[sessionId].participants.filter(
+        p => p.id.toString() !== userId.toString()
+      );
       
       // Notify remaining participants
-      io.to(currentSessionId).emit("participantLeft", userId);
-      io.to(currentSessionId).emit("participantsList", sessionParticipants[currentSessionId]);
+      io.to(sessionId).emit("participantLeft", userId);
+      io.to(sessionId).emit("participantsList", sessions[sessionId].participants);
       
       // Clean up empty sessions
-      if (sessionParticipants[currentSessionId].length === 0) {
-        delete sessionParticipants[currentSessionId];
+      if (sessions[sessionId].participants.length === 0) {
+        console.log(`Removing empty session ${sessionId}`);
+        delete sessions[sessionId];
       }
     }
   });
-  
 });
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
