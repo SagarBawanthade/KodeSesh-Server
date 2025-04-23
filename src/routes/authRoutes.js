@@ -1,14 +1,18 @@
 import express from "express";
-import { register, login, githubAuth, githubAuthCallback, getUserDetails } from "../controllers/authController.js";
+import { register, login, githubAuth, githubAuthCallback, getUserDetails, updateUserDetails } from "../controllers/authController.js";
 
 const router = express.Router();
 
 router.post("/register", register);
 router.post("/login", login);
-router.get("/getuser",getUserDetails);
 
-//Github Auth Routes
-router.get("/github", githubAuth);
-router.get("/github/callback", githubAuthCallback);
+
+// Route to get user details by ID
+router.get("/user/:id", getUserDetails);
+
+// Route to update user details by ID
+router.put("/user/:id", updateUserDetails);
+
+
 
 export default router;

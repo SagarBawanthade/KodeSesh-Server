@@ -1,6 +1,7 @@
 import User from "../models/User.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import mongoose from "mongoose";
 import passport from "passport";
 
 export const githubAuth = passport.authenticate("github", { scope: ["user:email"] });
@@ -106,9 +107,31 @@ export const setNewPassword = async (req, res) => {
   }
 };
 
+
+// Helper function to validate MongoDB ObjectId
+const isValidObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id);
+};
+
 export const getUserDetails = async (req, res) => {
   try {
-    const { id } = req.params; // Get user ID from the request parameters
+    const { id } = req.params;
+
+    // Check if ID is provided
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    // Validate if ID is a valid MongoDB ObjectId
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID format",
+      });
+    }
 
     // Find user by ID in the database
     const user = await User.findById(id);
@@ -120,14 +143,89 @@ export const getUserDetails = async (req, res) => {
       });
     }
 
-    // Return user details
+    // Return user details (excluding password)
     return res.status(200).json({
       success: true,
       message: "User details fetched successfully",
-      data: user,
+      data: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        createdAt: user.createdAt
+      }
     });
   } catch (error) {
     console.error("Error fetching user details:", error);
+
+    // Handle errors
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error",
+      error: error.message,
+    });
+  }
+};
+
+export const updateUserDetails = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if ID is provided
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required",
+      });
+    }
+
+    // Validate if ID is a valid MongoDB ObjectId
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid user ID format",
+      });
+    }
+
+    const { name, email, password } = req.body;
+
+  
+
+    // Create update object
+    const updateData = { name, email };
+
+    // If password provided, hash it
+    if (password) {
+      const salt = await bcrypt.genSalt(10);
+      updateData.password = await bcrypt.hash(password, salt);
+    }
+
+    // Find and update user by ID
+    const updatedUser = await User.findByIdAndUpdate(
+      id,
+      updateData,
+      { new: true } // Return the updated document
+    ).select('-password'); // Exclude password from returned data
+
+    if (!updatedUser) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // Return updated user details (excluding password)
+    return res.status(200).json({
+      success: true,
+      message: "User details updated successfully",
+      data: {
+        _id: updatedUser._id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        createdAt: updatedUser.createdAt
+      }
+    });
+  } catch (error) {
+    console.error("Error updating user details:", error);
 
     // Handle errors
     return res.status(500).json({
