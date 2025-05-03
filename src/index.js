@@ -7,7 +7,6 @@ import { Server } from "socket.io";
 import authRoutes from "./routes/authRoutes.js";
 import sessionRoutes from "./routes/sessionRoutes.js";
 import executeRoute from "./routes/executeRoute.js";
-// import { getFileExtension } from "./utils.js";
 import { exec } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
@@ -136,6 +135,13 @@ io.on("connection", (socket) => {
     const clients = io.sockets.adapter.rooms.get(sessionId);
     console.log(`Clients in session ${sessionId}: ${clients ? clients.size : 0}`);
   });
+  
+   // Handle typing indicator events
+   socket.on('userTyping', (data) => {
+    // Broadcast to everyone else in the session
+    socket.to(data.sessionId).emit('userTyping', data);
+  });
+
   
   socket.on("userJoined", ({ userId: id, name, isHost, sessionId }) => {
     userId = id;
