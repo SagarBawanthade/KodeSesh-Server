@@ -215,6 +215,18 @@ io.on("connection", (socket) => {
       socket.emit('languageUpdate', { language: sessions[sessionId].language });
     }
   });
+
+
+  socket.on('newPR', (data) => {
+  // Broadcast to everyone in the session except sender
+  socket.to(data.sessionId).emit('newPR', data);
+});
+
+socket.on('requestPRs', (data) => {
+  // Broadcast the request to everyone in the session
+  socket.to(data.sessionId).emit('requestPRs', data);
+});
+
   
   socket.on("codeUpdate", ({ sessionId, code }) => {
     console.log(`Client ${socket.id} sent code update for session ${sessionId}`);
