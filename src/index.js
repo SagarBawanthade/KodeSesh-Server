@@ -218,17 +218,24 @@ io.on("connection", (socket) => {
 
 
   
-  socket.on('newPR', (data) => {
-  console.log('📤 Broadcasting new PR:', data.pr.id);
-  // Broadcast to everyone in the session except sender
-  socket.to(data.sessionId).emit('newPR', data);
-});
+   socket.on('newPR', (data) => {
+    console.log(`📤 PR from ${socket.id} for session ${data.sessionId}:`, data.pr.title);
+    
+    // Broadcast to ALL OTHER users in the session
+    socket.to(data.sessionId).emit('newPR', {
+      sessionId: data.sessionId,
+      pr: data.pr,
+      fromSocketId: socket.id
+    });
+    
+    console.log(`📡 Broadcasted to session ${data.sessionId}`);
+  });
 
-socket.on('requestPRs', (data) => {
-  console.log('📨 Broadcasting PR request for session:', data.sessionId);
-  // Broadcast the request to everyone in the session
-  socket.to(data.sessionId).emit('requestPRs', data);
-});
+  socket.on('requestPRs', (data) => {
+    console.log(`📨 PR sync request for session ${data.sessionId}`);
+    socket.to(data.sessionId).emit('requestPRs', data);
+  });
+
 
   
   socket.on("codeUpdate", ({ sessionId, code }) => {
