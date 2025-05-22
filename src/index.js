@@ -217,12 +217,15 @@ io.on("connection", (socket) => {
   });
 
 
+  
   socket.on('newPR', (data) => {
+  console.log('📤 Broadcasting new PR:', data.pr.id);
   // Broadcast to everyone in the session except sender
   socket.to(data.sessionId).emit('newPR', data);
 });
 
 socket.on('requestPRs', (data) => {
+  console.log('📨 Broadcasting PR request for session:', data.sessionId);
   // Broadcast the request to everyone in the session
   socket.to(data.sessionId).emit('requestPRs', data);
 });
