@@ -10,7 +10,13 @@ import executeRoute from "./routes/executeRoute.js";
 import { exec } from 'child_process';
 import { promises as fs } from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import natsService from "./services/natsService.js";
 
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 dotenv.config();
 connectDB();
@@ -20,13 +26,24 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Helper function to get file extension
+function getFileExtension(language) {
+  const extensions = {
+    'python': 'py',
+    'java': 'java',
+    'cpp': 'cpp',
+    'golang': 'go',
+    'javascript': 'js'
+  };
+  return extensions[language.toLowerCase()] || 'txt';
+}
+
 // Utility function to generate unique filename
 function generateUniqueFilename(language) {
   const timestamp = Date.now();
   const randomString = Math.random().toString(36).substring(7);
   return `code_${timestamp}_${randomString}.${getFileExtension(language)}`;
 }
-
 
 // Execute code for different languages
 async function executeCode(language, code) {
@@ -92,7 +109,7 @@ const io = new Server(server, {
     origin: "*",
     methods: ["GET", "POST"],
   },
-  transports: ["websocket", "polling"], // Add polling as fallback
+  transports: ["websocket", "polling"],
 });
 
 // Global session storage
@@ -109,7 +126,36 @@ function findSocketByUserId(sessionId, userId) {
   return participant ? io.sockets.sockets.get(participant.socketId) : null;
 }
 
-// Single connection handler
+// Initialize NATS connection
+async function initializeNATS() {
+  const natsUrl = process.env.NATS_URL || 'nats://localhost:4222';
+  const connected = await natsService.connect(natsUrl);
+  
+  if (connected) {
+    console.log('✅ NATS initialized successfully');
+    
+    // Subscribe to global PR sync requests
+    const sub = natsService.nc.subscribe('pr.sync.request');
+    
+    (async () => {
+      for await (const msg of sub) {
+        try {
+          const data = natsService.jc.decode(msg.data);
+          console.log('📨 Received global PR sync request via NATS:', data);
+          
+          // Handle sync request by broadcasting to appropriate session
+          io.to(data.sessionId).emit('requestPRSync', data);
+        } catch (error) {
+          console.error('Error processing NATS message:', error);
+        }
+      }
+    })();
+  } else {
+    console.warn('⚠️ NATS connection failed. PR sync across instances will not work.');
+  }
+}
+
+// Socket.IO connection handler
 io.on("connection", (socket) => {
   console.log("New client connected:", socket.id);
   
@@ -117,7 +163,8 @@ io.on("connection", (socket) => {
   let userId = null;
   let currentSessionId = null;
   
-  socket.on("joinSession", (sessionId) => {
+  // Handle session joining
+  socket.on("joinSession", async (sessionId) => {
     console.log(`Client ${socket.id} joining session: ${sessionId}`);
     socket.join(sessionId);
     currentSessionId = sessionId;
@@ -127,8 +174,25 @@ io.on("connection", (socket) => {
       sessions[sessionId] = {
         participants: [],
         language: 'javascript',
-        code: '// Start writing your code here!'
+        code: '// Start writing your code here!',
+        natsSubscribed: false
       };
+    }
+    
+    // Subscribe to NATS PR events for this session
+    if (!sessions[sessionId].natsSubscribed) {
+      await natsService.subscribeToPREvents(sessionId, (data) => {
+        console.log(`📥 Received PR event via NATS for session ${sessionId}:`, data.eventType);
+        
+        // Broadcast NATS PR events to all clients in the session
+        io.to(sessionId).emit('prSync', {
+          sessionId: data.sessionId,
+          eventType: data.eventType,
+          prData: data.prData
+        });
+      });
+      
+      sessions[sessionId].natsSubscribed = true;
     }
     
     // Get number of clients in room
@@ -136,13 +200,12 @@ io.on("connection", (socket) => {
     console.log(`Clients in session ${sessionId}: ${clients ? clients.size : 0}`);
   });
   
-   // Handle typing indicator events
-   socket.on('userTyping', (data) => {
-    // Broadcast to everyone else in the session
+  // Handle typing indicator events
+  socket.on('userTyping', (data) => {
     socket.to(data.sessionId).emit('userTyping', data);
   });
-
   
+  // Handle user joining
   socket.on("userJoined", ({ userId: id, name, isHost, sessionId }) => {
     userId = id;
     currentSessionId = sessionId;
@@ -151,7 +214,8 @@ io.on("connection", (socket) => {
       sessions[sessionId] = {
         participants: [],
         language: 'javascript',
-        code: '// Start writing your code here!'
+        code: '// Start writing your code here!',
+        natsSubscribed: false
       };
     }
     
@@ -183,6 +247,7 @@ io.on("connection", (socket) => {
     io.to(sessionId).emit("participantsList", sessions[sessionId].participants);
   });
   
+  // Get participants list
   socket.on("getParticipants", (sessionId) => {
     if (sessions[sessionId]) {
       console.log(`Sending participants list for session ${sessionId}: ${sessions[sessionId].participants.length} participants`);
@@ -195,7 +260,33 @@ io.on("connection", (socket) => {
       socket.emit("participantsList", []);
     }
   });
-
+  
+  // Enhanced PR sync with NATS
+  socket.on('prSync', async (data) => {
+    console.log(`📤 PR sync event from ${socket.id}:`, data.eventType);
+    
+    // Broadcast locally via Socket.io
+    socket.to(data.sessionId).emit('prSync', data);
+    
+    // Publish to NATS for cross-instance sync
+    await natsService.publishPREvent(
+      data.sessionId, 
+      data.eventType, 
+      data.prData
+    );
+  });
+  
+  // Handle PR sync requests
+  socket.on('requestPRSync', async (data) => {
+    console.log(`📨 PR sync request for session ${data.sessionId}`);
+    
+    // Request via NATS for cross-instance sync
+    await natsService.requestPRSync(data.sessionId, data.userId);
+    
+    // Also handle locally
+    socket.to(data.sessionId).emit('requestPRSync', data);
+  });
+  
   // Handle language update
   socket.on('languageUpdate', ({ sessionId, language }) => {
     console.log(`Language update in session ${sessionId}: ${language}`);
@@ -215,32 +306,29 @@ io.on("connection", (socket) => {
       socket.emit('languageUpdate', { language: sessions[sessionId].language });
     }
   });
-
-
   
-   socket.on('newPR', (data) => {
-    console.log(`📤 PR from ${socket.id} for session ${data.sessionId}:`, data.pr.title);
-    
-    // Broadcast to ALL OTHER users in the session
-    socket.to(data.sessionId).emit('newPR', {
-      sessionId: data.sessionId,
-      pr: data.pr,
-      fromSocketId: socket.id
-    });
-    
-    console.log(`📡 Broadcasted to session ${data.sessionId}`);
+  // Handle session ending
+  socket.on("sessionEnding", (data) => {
+    console.log(`Session ${data.sessionId} is ending`);
+    socket.to(data.sessionId).emit("sessionEnding", data);
   });
-
-  socket.on('requestPRs', (data) => {
-    console.log(`📨 PR sync request for session ${data.sessionId}`);
-    socket.to(data.sessionId).emit('requestPRs', data);
-  });
-
-
   
+  // Handle terminal updates
+  socket.on("terminalUpdate", (data) => {
+    socket.to(data.sessionId).emit("terminalUpdate", data);
+  });
+  
+  // Handle terminal history requests
+  socket.on("getTerminalHistory", (sessionId) => {
+    // In a production app, you'd store and retrieve terminal history
+    socket.emit("terminalHistory", { sessionId, history: [] });
+  });
+  
+  // Handle code updates
   socket.on("codeUpdate", ({ sessionId, code }) => {
     console.log(`Client ${socket.id} sent code update for session ${sessionId}`);
-    // Make sure you're broadcasting the code content, not the whole object
+    
+    // Broadcast the code content to other users
     socket.to(sessionId).emit("codeUpdate", code);
     
     // Store latest code in session
@@ -248,7 +336,7 @@ io.on("connection", (socket) => {
       sessions[sessionId].code = code;
     }
   });
-
+  
   // Listen for code execution results from other users
   socket.on("executionResult", ({ sessionId, output, error, terminalEntries }) => {
     console.log(`Client ${socket.id} shared execution result for session ${sessionId}`);
@@ -262,13 +350,11 @@ io.on("connection", (socket) => {
     }
   });
   
-  // ===== IMPROVED WEBRTC SIGNALING =====
+  // ===== WebRTC Signaling =====
   
   // WebRTC signaling - ready for connections
   socket.on("rtcReady", ({ sessionId, userId }) => {
     console.log(`Client ${userId} (${socket.id}) is ready for WebRTC in session ${sessionId}`);
-    
-    // Notify all other clients in the session that a new participant is ready
     socket.to(sessionId).emit("rtcNewParticipant", { participantId: userId });
   });
   
@@ -298,149 +384,110 @@ io.on("connection", (socket) => {
     }
   });
   
-  // WebRTC offer from one peer to another
+  // WebRTC offer
   socket.on("rtcOffer", ({ sessionId, senderId, receiverId, sdp }) => {
     console.log(`Client ${senderId} sent offer to ${receiverId}`);
     
-    // Try to find the target socket
-    if (sessions[sessionId]) {
-      const targetParticipant = sessions[sessionId].participants.find(
-        p => p.id.toString() === receiverId.toString()
-      );
-      
-      if (targetParticipant) {
-        // Send directly to the receiver
-        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
-        if (targetSocket) {
-          targetSocket.emit("rtcOffer", { senderId, sdp });
-          return;
-        }
-      }
+    const targetSocket = findSocketByUserId(sessionId, receiverId);
+    if (targetSocket) {
+      targetSocket.emit("rtcOffer", { senderId, sdp });
+    } else {
+      socket.to(sessionId).emit("rtcOffer", { senderId, sdp });
     }
-    
-    // Fallback: broadcast to session (less efficient but ensures delivery)
-    socket.to(sessionId).emit("rtcOffer", { senderId, sdp });
   });
   
-  // WebRTC answer from recipient back to offerer
+  // WebRTC answer
   socket.on("rtcAnswer", ({ sessionId, senderId, receiverId, sdp }) => {
     console.log(`Client ${senderId} sent answer to ${receiverId}`);
     
-    // Try to find the target socket
-    if (sessions[sessionId]) {
-      const targetParticipant = sessions[sessionId].participants.find(
-        p => p.id.toString() === receiverId.toString()
-      );
-      
-      if (targetParticipant) {
-        // Send directly to the receiver
-        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
-        if (targetSocket) {
-          targetSocket.emit("rtcAnswer", { senderId, sdp });
-          return;
-        }
-      }
+    const targetSocket = findSocketByUserId(sessionId, receiverId);
+    if (targetSocket) {
+      targetSocket.emit("rtcAnswer", { senderId, sdp });
+    } else {
+      socket.to(sessionId).emit("rtcAnswer", { senderId, sdp });
     }
-    
-    // Fallback: broadcast to session
-    socket.to(sessionId).emit("rtcAnswer", { senderId, sdp });
   });
   
   // WebRTC ICE candidates
   socket.on("rtcIceCandidate", ({ sessionId, senderId, receiverId, candidate }) => {
     console.log(`Client ${senderId} sent ICE candidate to ${receiverId}`);
     
-    // Try to find the target socket
-    if (sessions[sessionId]) {
-      const targetParticipant = sessions[sessionId].participants.find(
-        p => p.id.toString() === receiverId.toString()
-      );
-      
-      if (targetParticipant) {
-        // Send directly to the receiver
-        const targetSocket = io.sockets.sockets.get(targetParticipant.socketId);
-        if (targetSocket) {
-          targetSocket.emit("rtcIceCandidate", { senderId, candidate });
-          return;
-        }
-      }
+    const targetSocket = findSocketByUserId(sessionId, receiverId);
+    if (targetSocket) {
+      targetSocket.emit("rtcIceCandidate", { senderId, candidate });
+    } else {
+      socket.to(sessionId).emit("rtcIceCandidate", { senderId, candidate });
     }
-    
-    // Fallback: broadcast to session
-    socket.to(sessionId).emit("rtcIceCandidate", { senderId, candidate });
   });
   
-  // Handle audio/video toggling notifications
+  // Handle audio/video toggling
   socket.on("audioToggled", ({ sessionId, userId, isMuted }) => {
     console.log(`User ${userId} ${isMuted ? 'muted' : 'unmuted'} their audio`);
     
-    // Update participant status
     if (sessions[sessionId]) {
-      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      const participant = sessions[sessionId].participants.find(
+        p => p.id.toString() === userId.toString()
+      );
       if (participant) {
         participant.isMuted = isMuted;
       }
     }
     
-    // Broadcast to all participants in the session
     socket.to(sessionId).emit("audioToggled", { userId, isMuted });
-    
-    // Update participants list
     io.to(sessionId).emit("participantsList", sessions[sessionId]?.participants || []);
   });
   
   socket.on("videoToggled", ({ sessionId, userId, isVideoOff }) => {
     console.log(`User ${userId} ${isVideoOff ? 'turned off' : 'turned on'} their video`);
     
-    // Update participant status
     if (sessions[sessionId]) {
-      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      const participant = sessions[sessionId].participants.find(
+        p => p.id.toString() === userId.toString()
+      );
       if (participant) {
         participant.isVideoOff = isVideoOff;
       }
     }
     
-    // Broadcast to all participants in the session
     socket.to(sessionId).emit("videoToggled", { userId, isVideoOff });
-    
-    // Update participants list
     io.to(sessionId).emit("participantsList", sessions[sessionId]?.participants || []);
   });
   
+  // Screen sharing events
   socket.on("screenSharingStarted", ({ sessionId, userId }) => {
     console.log(`User ${userId} started screen sharing`);
     
-    // Update participant status
     if (sessions[sessionId]) {
-      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      const participant = sessions[sessionId].participants.find(
+        p => p.id.toString() === userId.toString()
+      );
       if (participant) {
         participant.isScreenSharing = true;
       }
     }
     
-    // Broadcast to all participants in the session
     socket.to(sessionId).emit("screenSharingStarted", { userId });
   });
   
   socket.on("screenSharingEnded", ({ sessionId, userId }) => {
     console.log(`User ${userId} ended screen sharing`);
     
-    // Update participant status
     if (sessions[sessionId]) {
-      const participant = sessions[sessionId].participants.find(p => p.id.toString() === userId.toString());
+      const participant = sessions[sessionId].participants.find(
+        p => p.id.toString() === userId.toString()
+      );
       if (participant) {
         participant.isScreenSharing = false;
       }
     }
     
-    // Broadcast to all participants in the session
     socket.to(sessionId).emit("screenSharingEnded", { userId });
   });
-
-  socket.on("disconnect", () => {
+  
+  // Handle disconnection
+  socket.on("disconnect", async () => {
     console.log(`Client disconnected: ${socket.id}`);
     
-    // Get sessionId and userId stored in socket data
     const sessionId = socket.sessionId;
     const userId = socket.userId;
     
@@ -459,11 +506,51 @@ io.on("connection", (socket) => {
       // Clean up empty sessions
       if (sessions[sessionId].participants.length === 0) {
         console.log(`Removing empty session ${sessionId}`);
+        
+        // Unsubscribe from NATS events for this session
+        if (sessions[sessionId].natsSubscribed) {
+          await natsService.unsubscribeFromPREvents(sessionId);
+        }
+        
         delete sessions[sessionId];
       }
     }
   });
 });
 
+// Start server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, async () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  
+  // Initialize NATS after server starts
+  await initializeNATS();
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down server...');
+  
+  // Close NATS connection
+  await natsService.close();
+  
+  // Close server
+  server.close(() => {
+    console.log('✅ Server shut down gracefully');
+    process.exit(0);
+  });
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
+});
+
+export default app;
